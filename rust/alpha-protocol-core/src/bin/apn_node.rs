@@ -11,15 +11,24 @@
 use std::{
     env,
     io::{BufRead, IsTerminal, Write},
+    time::Duration,
 };
 
 use alpha_protocol_core::{
     identity::NodeIdentity,
     identity_storage,
-    node::{AlphaNodeBuilder, NodeEvent},
-    DEFAULT_NATS_RELAY,
+    relay::{subjects, NatsRelay, PeerAnnouncement, RelayConfig, RelayEvent},
 };
 use tokio::sync::mpsc;
+
+/// Options for `apn_node run`.
+struct RunOptions {
+    /// `--relay`; overrides `APN_RELAY_URL`
+    relay_url: Option<String>,
+    heartbeat_interval: u64,
+    enable_heartbeat: bool,
+    device_name: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,39 +46,48 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
-    init_logging("info");
+    let mut opts = RunOptions {
+        relay_url: None,
+        heartbeat_interval: 30,
+        enable_heartbeat: true,
+        device_name: None,
+    };
 
-    let mut port: u16 = 4001;
-    let mut relay_url = DEFAULT_NATS_RELAY.to_string();
-    let mut bootstrap_peers: Vec<String> = vec![];
-    let mut heartbeat_interval: u64 = 30; // seconds
-    let mut enable_heartbeat = true;
-    let mut device_name: Option<String> = None;
+    let value = |args: &[String], i: usize| -> anyhow::Result<String> {
+        args.get(i + 1)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} requires a value", args[i]))
+    };
 
-    // Parse args
+    let mut ignored_p2p_flag = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--port" => {
-                port = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("--port requires a value"))?
-                    .parse()?;
-                i += 2;
-            }
             "--relay" => {
-                relay_url = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("--relay requires a value"))?
-                    .clone();
+                opts.relay_url = Some(value(&args, i)?);
                 i += 2;
             }
-            "--bootstrap" => {
-                let peer = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("--bootstrap requires a value"))?
-                    .clone();
-                bootstrap_peers.push(peer);
+            "--heartbeat-interval" => {
+                opts.heartbeat_interval = value(&args, i)?.parse()?;
+                anyhow::ensure!(
+                    opts.heartbeat_interval >= 1,
+                    "--heartbeat-interval must be at least 1"
+                );
+                i += 2;
+            }
+            "--no-heartbeat" => {
+                opts.enable_heartbeat = false;
+                i += 1;
+            }
+            "--name" => {
+                opts.device_name = Some(value(&args, i)?);
+                i += 2;
+            }
+            // Peer-to-peer transport is not part of this build. Accept the old
+            // flags so existing scripts keep working, and say so.
+            "--port" | "--bootstrap" => {
+                value(&args, i)?;
+                ignored_p2p_flag = true;
                 i += 2;
             }
             "--import" => {
@@ -84,160 +102,154 @@ async fn main() -> anyhow::Result<()> {
                 // when none exists.
                 i += 1;
             }
-            "--heartbeat-interval" => {
-                heartbeat_interval = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("--heartbeat-interval requires a value"))?
-                    .parse()?;
-                i += 2;
-            }
-            "--no-heartbeat" => {
-                enable_heartbeat = false;
-                i += 1;
-            }
-            "--name" => {
-                device_name = Some(
-                    args.get(i + 1)
-                        .ok_or_else(|| anyhow::anyhow!("--name requires a value"))?
-                        .clone(),
-                );
-                i += 2;
+            "--version" | "-V" => {
+                println!("apn_node {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
             }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
             }
-            _ => {
-                eprintln!("Unknown option: {}", args[i]);
+            other => {
+                eprintln!("Unknown option: {}\n", other);
                 print_help();
-                return Ok(());
+                std::process::exit(2);
             }
         }
     }
 
-    // Create event channel
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<NodeEvent>();
+    init_logging("info,async_nats=warn");
+    if ignored_p2p_flag {
+        tracing::warn!(
+            "--port/--bootstrap are ignored: this build has no peer-to-peer transport, \
+             it talks to the relay only"
+        );
+    }
 
+    run(opts).await
+}
+
+async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // Load or create identity (with persistence)
     let (identity, identity_created) = identity_storage::load_or_create()?;
     if identity_created {
         announce_new_identity(&identity)?;
     }
+    let node_id = identity.short_id();
 
-    // Build the node with persistent identity
-    let mut builder = AlphaNodeBuilder::new()
-        .with_port(port)
-        .with_relay(&relay_url)
-        .with_bootstrap_peers(bootstrap_peers)
-        .with_capabilities(vec![
-            "compute".to_string(),
-            "relay".to_string(),
-            "storage".to_string(),
-        ])
-        .with_identity(identity);
-
-    if let Some(ref name) = device_name {
-        builder = builder.with_device_name(name);
+    let mut relay_config = RelayConfig::from_env(&node_id)?;
+    if let Some(url) = &opts.relay_url {
+        relay_config.url = url.clone();
     }
 
-    let mut node = builder.build(event_tx)?;
+    tracing::info!(
+        "APN node {} v{} starting",
+        node_id,
+        env!("CARGO_PKG_VERSION")
+    );
 
-    println!("\n╔══════════════════════════════════════════════════════════════════╗");
-    println!("║              ALPHA PROTOCOL NETWORK - Node                       ║");
-    println!("╠══════════════════════════════════════════════════════════════════╣");
-    if let Some(ref name) = device_name {
-        println!("║  Name:     {:<53}║", name);
-    }
-    println!("║  Node ID:  {:<53}║", node.short_id());
-    println!("║  Address:  {:<53}║", node.address());
-    println!("║  P2P Port: {:<53}║", port);
-    println!("║  Relay:    {:<53}║", relay_url);
-    println!("╚══════════════════════════════════════════════════════════════════╝\n");
+    let (relay_tx, mut relay_rx) = mpsc::unbounded_channel::<RelayEvent>();
+    let mut relay = NatsRelay::new(relay_config, relay_tx);
+    // Returns immediately; the connection comes up (and comes back) in the
+    // background. A relay that is down does not stop the node from starting.
+    relay.connect().await?;
 
-    // Start the node
-    println!("🚀 Starting node...");
-    node.start().await?;
-    println!("✅ Node started!\n");
+    let mut ticker = tokio::time::interval(Duration::from_secs(opts.heartbeat_interval));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // the first tick fires at once; the connect event sends the first message
 
-    // Announce to the network (may fail if no peers yet, that's OK)
-    println!("📢 Announcing to network...");
-    match node.announce().await {
-        Ok(_) => println!("✅ Announced!\n"),
-        Err(e) => println!("⚠️  Announce pending (no peers yet): {}\n", e),
-    }
+    let mut announced = false;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
-    // Setup heartbeat interval
-    let mut heartbeat_timer = if enable_heartbeat {
-        println!("💓 Heartbeat enabled (interval: {}s)\n", heartbeat_interval);
-        Some(tokio::time::interval(std::time::Duration::from_secs(
-            heartbeat_interval,
-        )))
-    } else {
-        None
-    };
-
-    println!("👂 Listening for events... (Ctrl+C to quit)\n");
-
-    // Event loop
     loop {
         tokio::select! {
-            Some(event) = event_rx.recv() => {
+            Some(event) = relay_rx.recv() => {
                 match event {
-                    NodeEvent::Started { peer_id, address } => {
-                        println!("🟢 Node started: {} @ {}", peer_id, address);
-                    }
-                    NodeEvent::PeerConnected(peer) => {
-                        println!("🔗 Peer connected: {} ({} capabilities)",
-                            peer.peer_id,
-                            peer.capabilities.len()
-                        );
-                        if let Some(addr) = peer.wallet_address {
-                            println!("   Wallet: {}", addr);
-                        }
-                        for cap in &peer.capabilities {
-                            println!("   - {}", cap);
+                    RelayEvent::Connected => {
+                        // First connection: announce on apn.discovery.
+                        // Later reconnects: send a heartbeat straight away.
+                        let subject = if announced { subjects::HEARTBEAT } else { subjects::DISCOVERY };
+                        match publish_presence(&relay, &identity, &opts, subject).await {
+                            Ok(()) => {
+                                announced = true;
+                                ticker.reset();
+                            }
+                            Err(e) => tracing::warn!("Could not publish to {}: {:#}", subject, e),
                         }
                     }
-                    NodeEvent::PeerDisconnected(peer_id) => {
-                        println!("🔴 Peer disconnected: {}", peer_id);
-                    }
-                    NodeEvent::MessageReceived { from, message } => {
-                        println!("📨 Message from {}: {:?}", from, message);
-                    }
-                    NodeEvent::RelayConnected => {
-                        println!("🌐 Relay connected");
-                    }
-                    NodeEvent::RelayDisconnected => {
-                        println!("⚠️  Relay disconnected");
-                    }
-                    NodeEvent::Error(e) => {
-                        eprintln!("❌ Error: {}", e);
-                    }
+                    RelayEvent::Disconnected | RelayEvent::Error(_) => {}
+                    RelayEvent::MessageReceived { .. } => {}
                 }
             }
-            Some(_) = async {
-                if let Some(ref mut timer) = heartbeat_timer {
-                    Some(timer.tick().await)
-                } else {
-                    None
+            _ = ticker.tick(), if opts.enable_heartbeat => {
+                if !relay.is_connected() {
+                    tracing::debug!("Heartbeat skipped: relay not connected");
+                    continue;
                 }
-            } => {
-                // Send heartbeat
-                tracing::debug!("Sending heartbeat...");
-                if let Err(e) = node.send_heartbeat().await {
-                    tracing::error!("Heartbeat failed: {}", e);
-                } else {
-                    tracing::debug!("Heartbeat sent successfully");
+                let subject = if announced { subjects::HEARTBEAT } else { subjects::DISCOVERY };
+                match publish_presence(&relay, &identity, &opts, subject).await {
+                    Ok(()) => announced = true,
+                    Err(e) => tracing::warn!("Heartbeat failed: {:#}", e),
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                println!("\n👋 Shutting down...");
+            _ = &mut shutdown => {
+                tracing::info!("Shutting down");
                 break;
             }
         }
     }
 
+    let _ = relay.disconnect().await;
     Ok(())
+}
+
+/// Publish this node's presence message and wait until the relay has it.
+async fn publish_presence(
+    relay: &NatsRelay,
+    identity: &NodeIdentity,
+    opts: &RunOptions,
+    subject: &str,
+) -> anyhow::Result<()> {
+    let resources = alpha_protocol_core::resources::collect_resources().await.ok();
+    let announcement = PeerAnnouncement {
+        node_id: identity.short_id(),
+        wallet_address: identity.address().to_string(),
+        capabilities: vec!["compute".into(), "relay".into(), "storage".into()],
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        resources,
+        hostname: alpha_protocol_core::resources::get_hostname(),
+        device_name: opts.device_name.clone(),
+    };
+    relay
+        .publish(subject, &serde_json::to_vec(&announcement)?)
+        .await?;
+    relay.flush().await?;
+    tracing::debug!("Published to {}", subject);
+    Ok(())
+}
+
+/// Resolves on Ctrl+C or SIGTERM (what systemd sends on stop).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn init_logging(level: &str) {
@@ -324,13 +336,21 @@ fn print_help() {
     println!("  apn_node identity show-phrase   Show the recovery phrase");
     println!("  apn_node identity import        Replace the identity (phrase read from stdin)\n");
     println!("Options for run:");
-    println!("  --port <PORT>       P2P port (default: 4001)");
-    println!("  --relay <URL>       NATS relay URL (default: nats://nonlocal.info:4222)");
-    println!("  --bootstrap <ADDR>  Bootstrap peer multiaddr (can be used multiple times)");
+    println!("  --relay <URL>                Relay URL (overrides APN_RELAY_URL)");
     println!("  --heartbeat-interval <SECS>  Heartbeat interval in seconds (default: 30)");
-    println!("  --name <NAME>       Display name for this node (e.g. \"Sirak Studios\")");
-    println!("  --no-heartbeat      Disable heartbeat broadcasts");
-    println!("  -h, --help          Show this help\n");
+    println!("  --name <NAME>                Display name for this node");
+    println!("  --no-heartbeat               Announce once, send no heartbeats");
+    println!("  -V, --version                Show the version");
+    println!("  -h, --help                   Show this help\n");
+    println!("Environment:");
+    println!("  APN_RELAY_URL       nats://host:4222 or tls://host:4222 (TLS)");
+    println!("                      default: {}", alpha_protocol_core::DEFAULT_NATS_RELAY);
+    println!("  APN_RELAY_USER      relay user name   (with APN_RELAY_PASSWORD)");
+    println!("  APN_RELAY_PASSWORD  relay password");
+    println!("  APN_RELAY_CREDS     path to a NATS .creds file (instead of user/password)");
+    println!("  APN_RELAY_CA        optional PEM file with the relay's CA certificate");
+    println!("  APN_DATA_DIR        where the identity is kept (default ~/.apn)");
+    println!("  APN_LOG             log filter, e.g. debug\n");
     println!("Identity:");
     println!("  Stored in $APN_DATA_DIR (default ~/.apn), readable only by its owner.");
     println!("  The recovery phrase is shown once, when the identity is created.");

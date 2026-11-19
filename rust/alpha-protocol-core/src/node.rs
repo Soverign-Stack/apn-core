@@ -179,6 +179,7 @@ impl AlphaNode {
                 url: self.config.relay_url.clone(),
                 node_id: self.identity.short_id(),
                 auto_reconnect: true,
+                ..RelayConfig::default()
             };
 
             let mut relay = NatsRelay::new(relay_config, relay_tx);
