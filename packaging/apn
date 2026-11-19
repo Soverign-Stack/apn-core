@@ -1,0 +1,53 @@
+#!/bin/sh
+# apn - helper for the installed APN node service.
+# Runs the node's read-only commands as the "apn" service user, so they see
+# the same identity as the running service.
+set -eu
+
+NODE_BIN=/usr/local/bin/apn_node
+SERVICE=apn-node.service
+DATA_DIR=/var/lib/apn
+
+usage() {
+    cat <<'USAGE'
+Usage: sudo apn <command>
+
+  status        Is the node running and connected? When was the last heartbeat?
+  claim-code    Show the claim code to enter in the Dashboard
+  show-phrase   Show the recovery phrase (keep it private)
+  start         Start the node
+  stop          Stop the node
+  restart       Restart the node (after editing /etc/apn/node.env)
+  logs          Show the node's recent log (add -f to follow)
+USAGE
+}
+
+as_node_user() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Please run this with sudo:  sudo apn $*" >&2
+        exit 1
+    fi
+    # setpriv ships with util-linux on every systemd distribution.
+    exec setpriv --reuid apn --regid apn --init-groups \
+        env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$DATA_DIR" APN_DATA_DIR="$DATA_DIR" \
+        "$NODE_BIN" "$@"
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+    status)       as_node_user status ;;
+    claim-code)   as_node_user claim-code ;;
+    show-phrase)  as_node_user identity show-phrase ;;
+    start|stop|restart)
+        exec systemctl "$cmd" "$SERVICE" ;;
+    logs)
+        exec journalctl -u "$SERVICE" -n 100 --no-pager "$@" ;;
+    ""|-h|--help|help)
+        usage ;;
+    *)
+        echo "Unknown command: $cmd" >&2
+        usage >&2
+        exit 2 ;;
+esac
