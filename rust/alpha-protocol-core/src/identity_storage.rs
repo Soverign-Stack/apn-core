@@ -195,8 +195,7 @@ pub fn save_identity(identity: &NodeIdentity) -> Result<()> {
     let json = serde_json::to_string_pretty(&stored).context("Failed to serialize identity")?;
 
     // Write identity file, owner-only from creation
-    write_private_file(&identity_file, json.as_bytes())
-        .context("Failed to write identity file")?;
+    write_private_file(&identity_file, json.as_bytes()).context("Failed to write identity file")?;
 
     // Verify the saved file can be read back
     let verification =
@@ -277,12 +276,18 @@ mod tests {
         let path = dir.join("secret.json");
 
         write_private_file(&path, b"{}").unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         // A file that was left readable by others is tightened on load.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         ensure_private(&path).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }

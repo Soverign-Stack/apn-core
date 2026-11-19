@@ -123,10 +123,14 @@ pub fn load(node_id: &str) -> Result<Option<ClaimRecord>> {
     }
     identity_storage::ensure_private(&path)?;
 
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let stored: StoredClaim = serde_json::from_str(&contents)
-        .with_context(|| format!("{} is corrupted; delete it to get a new claim code", path.display()))?;
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let stored: StoredClaim = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "{} is corrupted; delete it to get a new claim code",
+            path.display()
+        )
+    })?;
 
     if stored.node_id != node_id {
         return Ok(None);

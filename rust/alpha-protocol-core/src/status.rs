@@ -146,8 +146,8 @@ pub fn load() -> Result<Option<NodeStatus>> {
     if !path.exists() {
         return Ok(None);
     }
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
     Ok(serde_json::from_str(&contents).ok())
 }
 

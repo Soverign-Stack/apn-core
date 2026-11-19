@@ -18,9 +18,9 @@ use std::{
 
 use alpha_protocol_core::{
     claim::{self, ClaimRecord},
+    heartbeat::{Capabilities, Hardware, Heartbeat, HEARTBEAT_INTERVAL_SECS},
     identity::NodeIdentity,
     identity_storage,
-    heartbeat::{Capabilities, Hardware, Heartbeat, HEARTBEAT_INTERVAL_SECS},
     relay::{subjects, NatsRelay, RelayConfig, RelayEvent},
     status::{self, NodeStatus, RelayState},
 };
@@ -41,7 +41,11 @@ struct RunOptions {
 
 fn env_flag(name: &str) -> bool {
     matches!(
-        env::var(name).unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        env::var(name)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
         "1" | "true" | "yes" | "on"
     )
 }
@@ -74,7 +78,9 @@ async fn main() -> anyhow::Result<()> {
         relay_url: None,
         heartbeat_interval: HEARTBEAT_INTERVAL_SECS,
         enable_heartbeat: true,
-        device_name: env::var("APN_NODE_NAME").ok().filter(|s| !s.trim().is_empty()),
+        device_name: env::var("APN_NODE_NAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
         share_hardware: env_flag("APN_SHARE_HARDWARE"),
         capabilities: Capabilities::ALL,
     };
@@ -299,7 +305,11 @@ fn status_command() -> anyhow::Result<()> {
     let node_id = identity.short_id();
     let ago = |t: i64| format!("{} ago", status::format_duration(now - t));
 
-    println!("Node:            {} (apn_node v{})", node_id, env!("CARGO_PKG_VERSION"));
+    println!(
+        "Node:            {} (apn_node v{})",
+        node_id,
+        env!("CARGO_PKG_VERSION")
+    );
 
     let node_status = status::load()?.filter(|s| s.node_id == node_id);
     let mut healthy = false;
@@ -330,7 +340,10 @@ fn status_command() -> anyhow::Result<()> {
                 }
                 healthy = s.relay_state == RelayState::Connected;
             } else {
-                println!("Node process:    NOT RUNNING (last seen {})", ago(s.updated_at));
+                println!(
+                    "Node process:    NOT RUNNING (last seen {})",
+                    ago(s.updated_at)
+                );
                 println!("Relay:           not connected - {}", s.relay_url);
             }
             match (s.last_heartbeat_at, &s.last_heartbeat_subject) {
@@ -351,12 +364,19 @@ fn status_command() -> anyhow::Result<()> {
             let created = chrono::DateTime::<chrono::Utc>::from_timestamp(record.created_at, 0)
                 .map(|t| t.format("%Y-%m-%d").to_string())
                 .unwrap_or_default();
-            println!("Claim code:      created {} - show it with `apn_node claim-code`", created);
-            println!("                 Whether the node has been claimed is shown in the Dashboard,");
+            println!(
+                "Claim code:      created {} - show it with `apn_node claim-code`",
+                created
+            );
+            println!(
+                "                 Whether the node has been claimed is shown in the Dashboard,"
+            );
             println!("                 the node itself is not told.");
         }
         None => {
-            println!("Claim code:      not created yet - run `apn_node claim-code` or start the node");
+            println!(
+                "Claim code:      not created yet - run `apn_node claim-code` or start the node"
+            );
         }
     }
 
@@ -378,7 +398,9 @@ async fn publish_presence(
     let hardware = if opts.share_hardware {
         Some(Hardware {
             hostname: alpha_protocol_core::resources::get_hostname(),
-            resources: alpha_protocol_core::resources::collect_resources().await.ok(),
+            resources: alpha_protocol_core::resources::collect_resources()
+                .await
+                .ok(),
         })
     } else {
         None
@@ -467,7 +489,9 @@ fn announce_new_claim_code(claim: &ClaimRecord) {
         println!();
         println!("CLAIM CODE:  {}", claim.code.display());
         println!();
-        println!("Sign in to the Dashboard and enter this code to add the node to your organization.");
+        println!(
+            "Sign in to the Dashboard and enter this code to add the node to your organization."
+        );
         println!("Keep it private. To see it again: apn_node claim-code");
         println!();
     } else {
@@ -502,7 +526,9 @@ fn identity_command(args: &[String]) -> anyhow::Result<()> {
                 );
             };
             eprintln!("Node {}", identity.short_id());
-            eprintln!("Recovery phrase (keep it private; anyone with it can impersonate this node):");
+            eprintln!(
+                "Recovery phrase (keep it private; anyone with it can impersonate this node):"
+            );
             println!("{}", identity.mnemonic_phrase());
             Ok(())
         }
@@ -553,7 +579,10 @@ fn print_help() {
     println!("  -h, --help                   Show this help\n");
     println!("Environment:");
     println!("  APN_RELAY_URL       nats://host:4222 or tls://host:4222 (TLS)");
-    println!("                      default: {}", alpha_protocol_core::DEFAULT_NATS_RELAY);
+    println!(
+        "                      default: {}",
+        alpha_protocol_core::DEFAULT_NATS_RELAY
+    );
     println!("  APN_RELAY_USER      relay user name   (with APN_RELAY_PASSWORD)");
     println!("  APN_RELAY_PASSWORD  relay password");
     println!("  APN_RELAY_CREDS     path to a NATS .creds file (instead of user/password)");

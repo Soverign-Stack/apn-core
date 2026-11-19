@@ -41,7 +41,11 @@ impl std::fmt::Debug for RelayAuth {
         match self {
             RelayAuth::None => write!(f, "None"),
             RelayAuth::UserPassword { user, .. } => {
-                write!(f, "UserPassword {{ user: {:?}, password: <redacted> }}", user)
+                write!(
+                    f,
+                    "UserPassword {{ user: {:?}, password: <redacted> }}",
+                    user
+                )
             }
             RelayAuth::CredsFile(path) => write!(f, "CredsFile({:?})", path),
         }
@@ -593,7 +597,10 @@ mod tests {
 
     #[test]
     fn test_auth_from_parts() {
-        assert_eq!(RelayAuth::from_parts(None, None, None).unwrap(), RelayAuth::None);
+        assert_eq!(
+            RelayAuth::from_parts(None, None, None).unwrap(),
+            RelayAuth::None
+        );
         assert_eq!(
             RelayAuth::from_parts(Some("u".into()), Some("p".into()), None).unwrap(),
             RelayAuth::UserPassword {
@@ -624,8 +631,14 @@ mod tests {
 
     #[test]
     fn test_redact_url_and_tls() {
-        assert_eq!(redact_url("nats://u:p@relay.example:4222"), "nats://relay.example:4222");
-        assert_eq!(redact_url("tls://relay.example:4222"), "tls://relay.example:4222");
+        assert_eq!(
+            redact_url("nats://u:p@relay.example:4222"),
+            "nats://relay.example:4222"
+        );
+        assert_eq!(
+            redact_url("tls://relay.example:4222"),
+            "tls://relay.example:4222"
+        );
         assert_eq!(
             split_url_credentials("tls://u:p@relay.example:4222"),
             (
