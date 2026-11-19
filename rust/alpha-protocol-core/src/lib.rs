@@ -35,6 +35,7 @@ pub mod relay;
 pub mod resources;
 pub mod reward_distributor;
 pub mod reward_tracker;
+pub mod status;
 pub mod wire;
 
 // Re-exports

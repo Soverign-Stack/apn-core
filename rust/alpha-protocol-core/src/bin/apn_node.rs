@@ -2,6 +2,7 @@
 //!
 //! Usage:
 //!   apn_node [run] [OPTIONS]        Run the node (default)
+//!   apn_node status                 Node id, relay connection, last heartbeat
 //!   apn_node claim-code             Show the claim code for the Dashboard
 //!   apn_node identity show-phrase   Show the recovery phrase
 //!   apn_node identity import        Replace the identity (phrase read from stdin)
@@ -21,6 +22,7 @@ use alpha_protocol_core::{
     identity_storage,
     heartbeat::{Capabilities, Hardware, Heartbeat, HEARTBEAT_INTERVAL_SECS},
     relay::{subjects, NatsRelay, RelayConfig, RelayEvent},
+    status::{self, NodeStatus, RelayState},
 };
 use tokio::sync::mpsc;
 
@@ -57,6 +59,10 @@ async fn main() -> anyhow::Result<()> {
         Some("claim-code") => {
             init_logging("warn");
             return claim_code_command();
+        }
+        Some("status") => {
+            init_logging("warn");
+            return status_command();
         }
         Some("run") => {
             args.remove(1);
@@ -186,6 +192,16 @@ async fn run(opts: RunOptions) -> anyhow::Result<()> {
 
     let (relay_tx, mut relay_rx) = mpsc::unbounded_channel::<RelayEvent>();
     let mut relay = NatsRelay::new(relay_config, relay_tx);
+
+    // Status file read by `apn_node status`.
+    let mut node_status = NodeStatus::new(
+        &node_id,
+        &relay.display_url(),
+        opts.heartbeat_interval,
+        now_unix(),
+    );
+    save_status(&node_status);
+
     // Returns immediately; the connection comes up (and comes back) in the
     // background. A relay that is down does not stop the node from starting.
     relay.connect().await?;
@@ -203,31 +219,47 @@ async fn run(opts: RunOptions) -> anyhow::Result<()> {
             Some(event) = relay_rx.recv() => {
                 match event {
                     RelayEvent::Connected => {
+                        node_status.set_relay_state(RelayState::Connected, now_unix());
                         // First connection: announce on apn.discovery.
                         // Later reconnects: send a heartbeat straight away.
                         let subject = if announced { subjects::HEARTBEAT } else { subjects::DISCOVERY };
                         match publish_presence(&relay, &identity, &opts, &claim_hash, subject).await {
                             Ok(()) => {
                                 announced = true;
+                                node_status.record_heartbeat(subject, now_unix());
                                 ticker.reset();
                             }
                             Err(e) => tracing::warn!("Could not publish to {}: {:#}", subject, e),
                         }
                     }
-                    RelayEvent::Disconnected | RelayEvent::Error(_) => {}
+                    RelayEvent::Disconnected => {
+                        node_status.set_relay_state(RelayState::Disconnected, now_unix());
+                    }
+                    RelayEvent::Error(e) => {
+                        node_status.last_relay_error = Some(e);
+                        node_status.updated_at = now_unix();
+                    }
                     RelayEvent::MessageReceived { .. } => {}
                 }
+                save_status(&node_status);
             }
-            _ = ticker.tick(), if opts.enable_heartbeat => {
-                if !relay.is_connected() {
+            _ = ticker.tick() => {
+                if !opts.enable_heartbeat {
+                    // keep the status file fresh, send nothing
+                } else if !relay.is_connected() {
                     tracing::debug!("Heartbeat skipped: relay not connected");
-                    continue;
+                } else {
+                    let subject = if announced { subjects::HEARTBEAT } else { subjects::DISCOVERY };
+                    match publish_presence(&relay, &identity, &opts, &claim_hash, subject).await {
+                        Ok(()) => {
+                            announced = true;
+                            node_status.record_heartbeat(subject, now_unix());
+                        }
+                        Err(e) => tracing::warn!("Heartbeat failed: {:#}", e),
+                    }
                 }
-                let subject = if announced { subjects::HEARTBEAT } else { subjects::DISCOVERY };
-                match publish_presence(&relay, &identity, &opts, &claim_hash, subject).await {
-                    Ok(()) => announced = true,
-                    Err(e) => tracing::warn!("Heartbeat failed: {:#}", e),
-                }
+                node_status.updated_at = now_unix();
+                save_status(&node_status);
             }
             _ = &mut shutdown => {
                 tracing::info!("Shutting down");
@@ -237,6 +269,100 @@ async fn run(opts: RunOptions) -> anyhow::Result<()> {
     }
 
     let _ = relay.disconnect().await;
+    node_status.set_relay_state(RelayState::Stopped, now_unix());
+    save_status(&node_status);
+    Ok(())
+}
+
+fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// The status file is a convenience: failing to write it must not stop the node.
+fn save_status(status: &NodeStatus) {
+    if let Err(e) = status.save() {
+        tracing::debug!("Could not write status file: {:#}", e);
+    }
+}
+
+/// `apn_node status`: node id, relay connection, last heartbeat, claim code.
+/// Exit code 0 when the node is running and connected, 1 otherwise.
+fn status_command() -> anyhow::Result<()> {
+    let now = now_unix();
+    let data_dir = identity_storage::get_config_dir()?;
+
+    let Some(identity) = identity_storage::load_identity()? else {
+        println!("Node:            no identity yet in {}", data_dir.display());
+        println!("                 Start the node once to create one.");
+        std::process::exit(1);
+    };
+    let node_id = identity.short_id();
+    let ago = |t: i64| format!("{} ago", status::format_duration(now - t));
+
+    println!("Node:            {} (apn_node v{})", node_id, env!("CARGO_PKG_VERSION"));
+
+    let node_status = status::load()?.filter(|s| s.node_id == node_id);
+    let mut healthy = false;
+    match &node_status {
+        None => {
+            println!("Node process:    NOT RUNNING (it has never run with this identity)");
+            println!("Relay:           not connected");
+            println!("Last heartbeat:  none sent yet");
+        }
+        Some(s) => {
+            let alive = s.process_alive(now);
+            if alive {
+                println!(
+                    "Node process:    running (pid {}, up {})",
+                    s.pid,
+                    status::format_duration(now - s.started_at)
+                );
+                println!(
+                    "Relay:           {} - {} (for {})",
+                    s.relay_state.label(),
+                    s.relay_url,
+                    status::format_duration(now - s.relay_state_since)
+                );
+                if s.relay_state != RelayState::Connected {
+                    if let Some(err) = &s.last_relay_error {
+                        println!("                 last error: {}", err);
+                    }
+                }
+                healthy = s.relay_state == RelayState::Connected;
+            } else {
+                println!("Node process:    NOT RUNNING (last seen {})", ago(s.updated_at));
+                println!("Relay:           not connected - {}", s.relay_url);
+            }
+            match (s.last_heartbeat_at, &s.last_heartbeat_subject) {
+                (Some(t), Some(subject)) => println!(
+                    "Last heartbeat:  {} on {} ({} sent since start, one every {} s)",
+                    ago(t),
+                    subject,
+                    s.heartbeats_sent,
+                    s.heartbeat_interval_secs
+                ),
+                _ => println!("Last heartbeat:  none sent yet"),
+            }
+        }
+    }
+
+    match claim::load(&node_id)? {
+        Some(record) => {
+            let created = chrono::DateTime::<chrono::Utc>::from_timestamp(record.created_at, 0)
+                .map(|t| t.format("%Y-%m-%d").to_string())
+                .unwrap_or_default();
+            println!("Claim code:      created {} - show it with `apn_node claim-code`", created);
+            println!("                 Whether the node has been claimed is shown in the Dashboard,");
+            println!("                 the node itself is not told.");
+        }
+        None => {
+            println!("Claim code:      not created yet - run `apn_node claim-code` or start the node");
+        }
+    }
+
+    if !healthy {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -411,6 +537,7 @@ fn print_help() {
     println!("APN Node - Alpha Protocol Network node\n");
     println!("Usage:");
     println!("  apn_node [run] [OPTIONS]        Run the node (default)");
+    println!("  apn_node status                 Node id, relay connection, last heartbeat");
     println!("  apn_node claim-code             Show the claim code for the Dashboard");
     println!("  apn_node identity show-phrase   Show the recovery phrase");
     println!("  apn_node identity import        Replace the identity (phrase read from stdin)\n");
