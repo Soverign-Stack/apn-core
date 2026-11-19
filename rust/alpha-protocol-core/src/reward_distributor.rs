@@ -183,19 +183,21 @@ impl RewardDistributor {
         let total_rewards_i64 = total_rewards as i64;
 
         // Create batch record
-        sqlx::query!(
+        // Runtime-checked query: the compile-time `query!` macro needs a
+        // database at build time, which a clean checkout does not have.
+        sqlx::query(
             r#"
             INSERT INTO reward_batches (
                 id, batch_number, total_rewards, total_amount, from_wallet
             )
             VALUES ($1, $2, $3, $4, $5)
             "#,
-            batch_id,
-            batch_number,
-            total_rewards_i64,
-            total_amount,
-            wallet_address
         )
+        .bind(batch_id)
+        .bind(batch_number)
+        .bind(total_rewards_i64)
+        .bind(total_amount)
+        .bind(wallet_address)
         .execute(&self.db)
         .await?;
 
@@ -293,7 +295,7 @@ impl RewardDistributor {
 
     /// Mark batch as submitted to blockchain
     async fn mark_batch_submitted(&self, batch_id: Uuid, tx_hash: &str) -> Result<()> {
-        sqlx::query!(
+        sqlx::query(
             r#"
             UPDATE reward_batches
             SET status = 'submitted',
@@ -302,9 +304,9 @@ impl RewardDistributor {
                 updated_at = datetime('now', 'subsec')
             WHERE id = $1
             "#,
-            batch_id,
-            tx_hash
         )
+        .bind(batch_id)
+        .bind(tx_hash)
         .execute(&self.db)
         .await?;
 
