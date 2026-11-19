@@ -23,6 +23,7 @@
 
 pub mod crypto;
 pub mod economics;
+pub mod heartbeat;
 pub mod models;
 pub mod identity;
 pub mod identity_storage;

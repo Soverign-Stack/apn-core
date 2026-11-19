@@ -17,7 +17,8 @@ use std::{
 use alpha_protocol_core::{
     identity::NodeIdentity,
     identity_storage,
-    relay::{subjects, NatsRelay, PeerAnnouncement, RelayConfig, RelayEvent},
+    heartbeat::{Capabilities, Hardware, Heartbeat, HEARTBEAT_INTERVAL_SECS},
+    relay::{subjects, NatsRelay, RelayConfig, RelayEvent},
 };
 use tokio::sync::mpsc;
 
@@ -28,6 +29,17 @@ struct RunOptions {
     heartbeat_interval: u64,
     enable_heartbeat: bool,
     device_name: Option<String>,
+    /// `--share-hardware` / `APN_SHARE_HARDWARE=1`: also send hostname and
+    /// hardware details. Off by default.
+    share_hardware: bool,
+    capabilities: Capabilities,
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        env::var(name).unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[tokio::main]
@@ -48,9 +60,11 @@ async fn main() -> anyhow::Result<()> {
 
     let mut opts = RunOptions {
         relay_url: None,
-        heartbeat_interval: 30,
+        heartbeat_interval: HEARTBEAT_INTERVAL_SECS,
         enable_heartbeat: true,
-        device_name: None,
+        device_name: env::var("APN_NODE_NAME").ok().filter(|s| !s.trim().is_empty()),
+        share_hardware: env_flag("APN_SHARE_HARDWARE"),
+        capabilities: Capabilities::ALL,
     };
 
     let value = |args: &[String], i: usize| -> anyhow::Result<String> {
@@ -81,6 +95,15 @@ async fn main() -> anyhow::Result<()> {
             }
             "--name" => {
                 opts.device_name = Some(value(&args, i)?);
+                i += 2;
+            }
+            "--share-hardware" => {
+                opts.share_hardware = true;
+                i += 1;
+            }
+            "--capabilities" => {
+                opts.capabilities =
+                    Capabilities::parse_list(&value(&args, i)?).map_err(anyhow::Error::msg)?;
                 i += 2;
             }
             // Peer-to-peer transport is not part of this build. Accept the old
@@ -204,28 +227,39 @@ async fn run(opts: RunOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Publish this node's presence message and wait until the relay has it.
+/// Publish a signed heartbeat to `subject` and wait until the relay has it.
 async fn publish_presence(
     relay: &NatsRelay,
     identity: &NodeIdentity,
     opts: &RunOptions,
     subject: &str,
 ) -> anyhow::Result<()> {
-    let resources = alpha_protocol_core::resources::collect_resources().await.ok();
-    let announcement = PeerAnnouncement {
-        node_id: identity.short_id(),
-        wallet_address: identity.address().to_string(),
-        capabilities: vec!["compute".into(), "relay".into(), "storage".into()],
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        resources,
-        hostname: alpha_protocol_core::resources::get_hostname(),
-        device_name: opts.device_name.clone(),
+    // Hostname and hardware leave the machine only on explicit opt-in.
+    let hardware = if opts.share_hardware {
+        Some(Hardware {
+            hostname: alpha_protocol_core::resources::get_hostname(),
+            resources: alpha_protocol_core::resources::collect_resources().await.ok(),
+        })
+    } else {
+        None
     };
+
+    // The claim code is added in the next change; until then the hash is empty.
+    let claim_hash = "";
+
+    let heartbeat = Heartbeat::new_signed(
+        identity,
+        chrono::Utc::now().timestamp(),
+        claim_hash,
+        opts.capabilities,
+        opts.device_name.clone(),
+        hardware,
+    );
     relay
-        .publish(subject, &serde_json::to_vec(&announcement)?)
+        .publish(subject, &serde_json::to_vec(&heartbeat)?)
         .await?;
     relay.flush().await?;
-    tracing::debug!("Published to {}", subject);
+    tracing::debug!("Published signed heartbeat to {}", subject);
     Ok(())
 }
 
@@ -338,7 +372,10 @@ fn print_help() {
     println!("Options for run:");
     println!("  --relay <URL>                Relay URL (overrides APN_RELAY_URL)");
     println!("  --heartbeat-interval <SECS>  Heartbeat interval in seconds (default: 30)");
-    println!("  --name <NAME>                Display name for this node");
+    println!("  --name <NAME>                Display name for this node (also APN_NODE_NAME)");
+    println!("  --capabilities <LIST>        relay,compute,storage (default: all three)");
+    println!("  --share-hardware             Also send hostname and hardware details");
+    println!("                               (off by default; also APN_SHARE_HARDWARE=1)");
     println!("  --no-heartbeat               Announce once, send no heartbeats");
     println!("  -V, --version                Show the version");
     println!("  -h, --help                   Show this help\n");
