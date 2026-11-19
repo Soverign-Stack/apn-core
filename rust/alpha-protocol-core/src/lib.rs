@@ -21,6 +21,7 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+pub mod claim;
 pub mod crypto;
 pub mod economics;
 pub mod heartbeat;

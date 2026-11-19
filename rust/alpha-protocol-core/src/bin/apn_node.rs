@@ -2,6 +2,7 @@
 //!
 //! Usage:
 //!   apn_node [run] [OPTIONS]        Run the node (default)
+//!   apn_node claim-code             Show the claim code for the Dashboard
 //!   apn_node identity show-phrase   Show the recovery phrase
 //!   apn_node identity import        Replace the identity (phrase read from stdin)
 //!
@@ -15,6 +16,7 @@ use std::{
 };
 
 use alpha_protocol_core::{
+    claim::{self, ClaimRecord},
     identity::NodeIdentity,
     identity_storage,
     heartbeat::{Capabilities, Hardware, Heartbeat, HEARTBEAT_INTERVAL_SECS},
@@ -51,6 +53,10 @@ async fn main() -> anyhow::Result<()> {
         Some("identity") => {
             init_logging("warn");
             return identity_command(&args[2..]);
+        }
+        Some("claim-code") => {
+            init_logging("warn");
+            return claim_code_command();
         }
         Some("run") => {
             args.remove(1);
@@ -160,6 +166,13 @@ async fn run(opts: RunOptions) -> anyhow::Result<()> {
     }
     let node_id = identity.short_id();
 
+    // Claim code: created once, kept with the identity, only its hash is sent.
+    let (claim, claim_created) = claim::load_or_create(&node_id)?;
+    if claim_created {
+        announce_new_claim_code(&claim);
+    }
+    let claim_hash = claim.code.hash();
+
     let mut relay_config = RelayConfig::from_env(&node_id)?;
     if let Some(url) = &opts.relay_url {
         relay_config.url = url.clone();
@@ -193,7 +206,7 @@ async fn run(opts: RunOptions) -> anyhow::Result<()> {
                         // First connection: announce on apn.discovery.
                         // Later reconnects: send a heartbeat straight away.
                         let subject = if announced { subjects::HEARTBEAT } else { subjects::DISCOVERY };
-                        match publish_presence(&relay, &identity, &opts, subject).await {
+                        match publish_presence(&relay, &identity, &opts, &claim_hash, subject).await {
                             Ok(()) => {
                                 announced = true;
                                 ticker.reset();
@@ -211,7 +224,7 @@ async fn run(opts: RunOptions) -> anyhow::Result<()> {
                     continue;
                 }
                 let subject = if announced { subjects::HEARTBEAT } else { subjects::DISCOVERY };
-                match publish_presence(&relay, &identity, &opts, subject).await {
+                match publish_presence(&relay, &identity, &opts, &claim_hash, subject).await {
                     Ok(()) => announced = true,
                     Err(e) => tracing::warn!("Heartbeat failed: {:#}", e),
                 }
@@ -232,6 +245,7 @@ async fn publish_presence(
     relay: &NatsRelay,
     identity: &NodeIdentity,
     opts: &RunOptions,
+    claim_hash: &str,
     subject: &str,
 ) -> anyhow::Result<()> {
     // Hostname and hardware leave the machine only on explicit opt-in.
@@ -243,9 +257,6 @@ async fn publish_presence(
     } else {
         None
     };
-
-    // The claim code is added in the next change; until then the hash is empty.
-    let claim_hash = "";
 
     let heartbeat = Heartbeat::new_signed(
         identity,
@@ -322,6 +333,39 @@ fn announce_new_identity(identity: &NodeIdentity) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Called once, right after the claim code was created. Like the recovery
+/// phrase, the code is printed only on an interactive terminal, never into a
+/// service log.
+fn announce_new_claim_code(claim: &ClaimRecord) {
+    if std::io::stdout().is_terminal() {
+        println!();
+        println!("CLAIM CODE:  {}", claim.code.display());
+        println!();
+        println!("Sign in to the Dashboard and enter this code to add the node to your organization.");
+        println!("Keep it private. To see it again: apn_node claim-code");
+        println!();
+    } else {
+        tracing::info!(
+            "A claim code was created. It is not written to logs; \
+             run `apn_node claim-code` as the node's user to see it."
+        );
+    }
+}
+
+fn claim_code_command() -> anyhow::Result<()> {
+    let Some(identity) = identity_storage::load_identity()? else {
+        anyhow::bail!(
+            "No identity found in {}. Start the node once, then run this again.",
+            identity_storage::get_config_dir()?.display()
+        );
+    };
+    let (claim, _) = claim::load_or_create(&identity.short_id())?;
+    eprintln!("Node {}", identity.short_id());
+    eprintln!("Claim code (enter it in the Dashboard; keep it private):");
+    println!("{}", claim.code.display());
+    Ok(())
+}
+
 fn identity_command(args: &[String]) -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("show-phrase") => {
@@ -367,6 +411,7 @@ fn print_help() {
     println!("APN Node - Alpha Protocol Network node\n");
     println!("Usage:");
     println!("  apn_node [run] [OPTIONS]        Run the node (default)");
+    println!("  apn_node claim-code             Show the claim code for the Dashboard");
     println!("  apn_node identity show-phrase   Show the recovery phrase");
     println!("  apn_node identity import        Replace the identity (phrase read from stdin)\n");
     println!("Options for run:");
