@@ -1,7 +1,11 @@
-//! NATS Relay - Fallback for NAT traversal
+//! NATS Relay
 //!
-//! When direct P2P connections fail due to NAT, the NATS relay at
-//! nonlocal.info:4222 provides message routing.
+//! All node traffic goes through a NATS broker (`APN_RELAY_URL`). The client
+//! supports credentials (user/password or a NATS creds file) and TLS
+//! (`tls://` URLs), reconnects on its own with backoff, and reports every
+//! connect and disconnect.
+
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use async_nats::{Client, ConnectOptions};
@@ -11,15 +15,104 @@ use tokio::sync::mpsc;
 
 use crate::mesh::MeshMessage;
 
+/// Environment variables read by [`RelayConfig::from_env`].
+pub const ENV_RELAY_URL: &str = "APN_RELAY_URL";
+pub const ENV_RELAY_USER: &str = "APN_RELAY_USER";
+pub const ENV_RELAY_PASSWORD: &str = "APN_RELAY_PASSWORD";
+pub const ENV_RELAY_CREDS: &str = "APN_RELAY_CREDS";
+/// Optional PEM file with extra root certificates (private CA on the relay).
+pub const ENV_RELAY_CA: &str = "APN_RELAY_CA";
+
+/// How the node authenticates to the relay.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum RelayAuth {
+    /// No credentials (only works while the relay is still open).
+    #[default]
+    None,
+    /// `APN_RELAY_USER` / `APN_RELAY_PASSWORD`
+    UserPassword { user: String, password: String },
+    /// `APN_RELAY_CREDS`: path to a NATS `.creds` file
+    CredsFile(PathBuf),
+}
+
+// Never print the password.
+impl std::fmt::Debug for RelayAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelayAuth::None => write!(f, "None"),
+            RelayAuth::UserPassword { user, .. } => {
+                write!(
+                    f,
+                    "UserPassword {{ user: {:?}, password: <redacted> }}",
+                    user
+                )
+            }
+            RelayAuth::CredsFile(path) => write!(f, "CredsFile({:?})", path),
+        }
+    }
+}
+
+impl RelayAuth {
+    /// Short description for log lines (no secrets).
+    pub fn describe(&self) -> &'static str {
+        match self {
+            RelayAuth::None => "no credentials",
+            RelayAuth::UserPassword { .. } => "user/password",
+            RelayAuth::CredsFile(_) => "creds file",
+        }
+    }
+
+    /// Build from optional values (as read from the environment).
+    pub fn from_parts(
+        user: Option<String>,
+        password: Option<String>,
+        creds: Option<String>,
+    ) -> Result<Self> {
+        let clean = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+        let (user, password, creds) = (clean(user), clean(password), clean(creds));
+
+        match (user, password, creds) {
+            (None, None, None) => Ok(RelayAuth::None),
+            (None, None, Some(path)) => Ok(RelayAuth::CredsFile(PathBuf::from(path))),
+            (Some(user), Some(password), None) => Ok(RelayAuth::UserPassword { user, password }),
+            (Some(_), None, None) | (None, Some(_), None) => anyhow::bail!(
+                "{} and {} must be set together",
+                ENV_RELAY_USER,
+                ENV_RELAY_PASSWORD
+            ),
+            _ => anyhow::bail!(
+                "Set either {}/{} or {}, not both",
+                ENV_RELAY_USER,
+                ENV_RELAY_PASSWORD,
+                ENV_RELAY_CREDS
+            ),
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        Self::from_parts(
+            std::env::var(ENV_RELAY_USER).ok(),
+            std::env::var(ENV_RELAY_PASSWORD).ok(),
+            std::env::var(ENV_RELAY_CREDS).ok(),
+        )
+    }
+}
+
 /// NATS relay configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
-    /// NATS server URL
+    /// NATS server URL (`nats://host:4222` or `tls://host:4222`)
     pub url: String,
     /// Node identifier
     pub node_id: String,
     /// Reconnect on disconnect
     pub auto_reconnect: bool,
+    /// Credentials (never serialized)
+    #[serde(skip)]
+    pub auth: RelayAuth,
+    /// Extra root certificates for TLS (PEM file)
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
 }
 
 impl Default for RelayConfig {
@@ -28,8 +121,77 @@ impl Default for RelayConfig {
             url: crate::DEFAULT_NATS_RELAY.to_string(),
             node_id: String::new(),
             auto_reconnect: true,
+            auth: RelayAuth::None,
+            ca_file: None,
         }
     }
+}
+
+impl RelayConfig {
+    /// Read `APN_RELAY_URL`, credentials and CA file from the environment.
+    pub fn from_env(node_id: &str) -> Result<Self> {
+        let url = std::env::var(ENV_RELAY_URL)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| crate::DEFAULT_NATS_RELAY.to_string());
+        Ok(Self {
+            url,
+            node_id: node_id.to_string(),
+            auto_reconnect: true,
+            auth: RelayAuth::from_env()?,
+            ca_file: std::env::var(ENV_RELAY_CA)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from),
+        })
+    }
+
+    /// True when the URL asks for TLS.
+    pub fn uses_tls(&self) -> bool {
+        url_uses_tls(&self.url)
+    }
+}
+
+/// True for `tls://` URLs.
+pub fn url_uses_tls(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().starts_with("tls://")
+}
+
+/// The URL with any `user:password@` part removed, safe for logs and status.
+pub fn redact_url(url: &str) -> String {
+    match (url.find("://"), url.rfind('@')) {
+        (Some(scheme_end), Some(at)) if at > scheme_end => {
+            format!("{}{}", &url[..scheme_end + 3], &url[at + 1..])
+        }
+        (None, Some(at)) => url[at + 1..].to_string(),
+        _ => url.to_string(),
+    }
+}
+
+/// Split `scheme://user:password@host` into the bare URL and the credentials.
+pub fn split_url_credentials(url: &str) -> (String, Option<(String, String)>) {
+    let bare = redact_url(url);
+    let creds = match (url.find("://"), url.rfind('@')) {
+        (Some(scheme_end), Some(at)) if at > scheme_end => {
+            let userinfo = &url[scheme_end + 3..at];
+            userinfo
+                .split_once(':')
+                .map(|(u, p)| (u.to_string(), p.to_string()))
+        }
+        _ => None,
+    };
+    (bare, creds)
+}
+
+/// Delay before reconnect attempt number `attempt` (1-based).
+///
+/// First attempt is immediate, then 1 s, 2 s, 4 s ... capped at 60 s.
+pub fn reconnect_delay(attempt: usize) -> Duration {
+    if attempt <= 1 {
+        return Duration::ZERO;
+    }
+    let exp = (attempt - 2).min(6) as u32;
+    Duration::from_secs((1u64 << exp).min(60))
 }
 
 /// NATS relay client for NAT traversal
@@ -95,27 +257,132 @@ impl NatsRelay {
         }
     }
 
-    /// Connect to the NATS server
+    /// Start connecting to the NATS server.
+    ///
+    /// Returns as soon as the client exists; it does not wait for the server.
+    /// The connection is established (and re-established after any drop) in
+    /// the background with backoff. Each change is logged and reported as
+    /// [`RelayEvent::Connected`] / [`RelayEvent::Disconnected`].
     pub async fn connect(&mut self) -> Result<()> {
-        let options = ConnectOptions::new()
+        // Credentials written into the URL are honoured, but the URL that is
+        // logged, shown in status and handed to the client never has them.
+        let (shown_url, url_credentials) = split_url_credentials(&self.config.url);
+        let auth = match (&self.config.auth, url_credentials) {
+            (RelayAuth::None, Some((user, password))) => RelayAuth::UserPassword { user, password },
+            (configured, _) => configured.clone(),
+        };
+        let tls = self.config.uses_tls();
+
+        let mut options = ConnectOptions::new()
             .name(&self.config.node_id)
-            .retry_on_initial_connect();
+            .retry_on_initial_connect()
+            .connection_timeout(Duration::from_secs(10))
+            .ping_interval(Duration::from_secs(20))
+            .max_reconnects(None);
 
-        let client = async_nats::connect_with_options(&self.config.url, options)
+        options = options.reconnect_delay_callback({
+            let shown_url = shown_url.clone();
+            move |attempt| {
+                let base = reconnect_delay(attempt);
+                if base.is_zero() {
+                    return base;
+                }
+                // Up to 20% jitter so a fleet does not reconnect in step.
+                let jitter = base.mul_f64(rand::random::<f64>() * 0.2);
+                let delay = base + jitter;
+                tracing::info!(
+                    "Relay {}: retrying in {:.1}s (attempt {})",
+                    shown_url,
+                    delay.as_secs_f64(),
+                    attempt
+                );
+                delay
+            }
+        });
+
+        options = options.event_callback({
+            let tx = self.message_tx.clone();
+            let shown_url = shown_url.clone();
+            move |event| {
+                let tx = tx.clone();
+                let shown_url = shown_url.clone();
+                async move {
+                    match event {
+                        async_nats::Event::Connected => {
+                            tracing::info!("Relay CONNECTED: {}", shown_url);
+                            let _ = tx.send(RelayEvent::Connected);
+                        }
+                        async_nats::Event::Disconnected => {
+                            tracing::warn!(
+                                "Relay DISCONNECTED: {} (will reconnect automatically)",
+                                shown_url
+                            );
+                            let _ = tx.send(RelayEvent::Disconnected);
+                        }
+                        async_nats::Event::ClientError(err) => {
+                            tracing::warn!("Relay {}: connection attempt failed: {} (check the address, TLS setting and credentials)", shown_url, err);
+                            let _ = tx.send(RelayEvent::Error(err.to_string()));
+                        }
+                        async_nats::Event::ServerError(err) => {
+                            tracing::warn!("Relay {}: server error: {}", shown_url, err);
+                            let _ = tx.send(RelayEvent::Error(err.to_string()));
+                        }
+                        other => tracing::debug!("Relay {}: {}", shown_url, other),
+                    }
+                }
+            }
+        });
+
+        match &auth {
+            RelayAuth::None => {}
+            RelayAuth::UserPassword { user, password } => {
+                options = options.user_and_password(user.clone(), password.clone());
+            }
+            RelayAuth::CredsFile(path) => {
+                options = options
+                    .credentials_file(path)
+                    .await
+                    .with_context(|| format!("Cannot read relay creds file {}", path.display()))?;
+            }
+        }
+
+        if tls {
+            options = options.require_tls(true);
+        }
+        if let Some(ca) = &self.config.ca_file {
+            if !ca.is_file() {
+                anyhow::bail!("Relay CA file {} not found", ca.display());
+            }
+            options = options.add_root_certificates(ca.clone());
+        }
+
+        tracing::info!(
+            "Connecting to relay {} ({}, {})",
+            shown_url,
+            if tls {
+                "TLS required"
+            } else {
+                "TLS only if the relay asks for it"
+            },
+            auth.describe()
+        );
+
+        let client = async_nats::connect_with_options(shown_url.as_str(), options)
             .await
-            .context("Failed to connect to NATS relay")?;
+            .with_context(|| format!("Invalid relay configuration for {}", shown_url))?;
 
-        tracing::info!("Connected to NATS relay at {}", self.config.url);
         self.client = Some(client);
-
-        let _ = self.message_tx.send(RelayEvent::Connected);
         Ok(())
     }
 
     /// Disconnect from the NATS server
     pub async fn disconnect(&mut self) -> Result<()> {
         if let Some(client) = self.client.take() {
-            client.flush().await?;
+            // Flush only when there is a live connection, and never wait
+            // long: a flush against a dead relay would block shutdown.
+            if client.connection_state() == async_nats::connection::State::Connected {
+                let _ = tokio::time::timeout(Duration::from_secs(3), client.flush()).await;
+            }
             // Client will close when dropped
         }
 
@@ -280,9 +547,27 @@ impl NatsRelay {
         }
     }
 
-    /// Check if connected
+    /// True only while the connection to the server is up.
     pub fn is_connected(&self) -> bool {
-        self.client.is_some()
+        self.client
+            .as_ref()
+            .map(|c| c.connection_state() == async_nats::connection::State::Connected)
+            .unwrap_or(false)
+    }
+
+    /// Push buffered messages to the server (bounded wait).
+    pub async fn flush(&self) -> Result<()> {
+        let client = self.client.as_ref().context("Not connected to NATS")?;
+        tokio::time::timeout(Duration::from_secs(5), client.flush())
+            .await
+            .context("Relay flush timed out")?
+            .context("Relay flush failed")?;
+        Ok(())
+    }
+
+    /// The relay URL without credentials.
+    pub fn display_url(&self) -> String {
+        redact_url(&self.config.url)
     }
 }
 
@@ -308,6 +593,72 @@ mod tests {
     fn test_relay_config_default() {
         let config = RelayConfig::default();
         assert_eq!(config.url, crate::DEFAULT_NATS_RELAY);
+    }
+
+    #[test]
+    fn test_auth_from_parts() {
+        assert_eq!(
+            RelayAuth::from_parts(None, None, None).unwrap(),
+            RelayAuth::None
+        );
+        assert_eq!(
+            RelayAuth::from_parts(Some("u".into()), Some("p".into()), None).unwrap(),
+            RelayAuth::UserPassword {
+                user: "u".into(),
+                password: "p".into()
+            }
+        );
+        assert_eq!(
+            RelayAuth::from_parts(None, Some("".into()), Some("/etc/apn/node.creds".into()))
+                .unwrap(),
+            RelayAuth::CredsFile(PathBuf::from("/etc/apn/node.creds"))
+        );
+        // user without password, and both methods at once, are refused
+        assert!(RelayAuth::from_parts(Some("u".into()), None, None).is_err());
+        assert!(
+            RelayAuth::from_parts(Some("u".into()), Some("p".into()), Some("f".into())).is_err()
+        );
+    }
+
+    #[test]
+    fn test_auth_debug_hides_password() {
+        let auth = RelayAuth::UserPassword {
+            user: "node1".into(),
+            password: "hunter2-secret".into(),
+        };
+        assert!(!format!("{:?}", auth).contains("hunter2-secret"));
+    }
+
+    #[test]
+    fn test_redact_url_and_tls() {
+        assert_eq!(
+            redact_url("nats://u:p@relay.example:4222"),
+            "nats://relay.example:4222"
+        );
+        assert_eq!(
+            redact_url("tls://relay.example:4222"),
+            "tls://relay.example:4222"
+        );
+        assert_eq!(
+            split_url_credentials("tls://u:p@relay.example:4222"),
+            (
+                "tls://relay.example:4222".to_string(),
+                Some(("u".to_string(), "p".to_string()))
+            )
+        );
+        assert_eq!(split_url_credentials("nats://relay.example:4222").1, None);
+        assert!(url_uses_tls("tls://relay.example:4222"));
+        assert!(!url_uses_tls("nats://relay.example:4222"));
+    }
+
+    #[test]
+    fn test_reconnect_backoff() {
+        assert_eq!(reconnect_delay(1), Duration::ZERO);
+        assert_eq!(reconnect_delay(2), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(3), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(5), Duration::from_secs(8));
+        assert_eq!(reconnect_delay(8), Duration::from_secs(60));
+        assert_eq!(reconnect_delay(500), Duration::from_secs(60));
     }
 
     #[test]

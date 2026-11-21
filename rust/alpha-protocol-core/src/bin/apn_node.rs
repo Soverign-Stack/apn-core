@@ -1,262 +1,595 @@
-//! APN Node - Alpha Protocol Network CLI
-//!
-//! A simple CLI tool to test mesh networking between devices.
+//! APN Node - Alpha Protocol Network node
 //!
 //! Usage:
-//!   apn_node [OPTIONS]
+//!   apn_node [run] [OPTIONS]        Run the node (default)
+//!   apn_node status                 Node id, relay connection, last heartbeat
+//!   apn_node claim-code             Show the claim code for the Dashboard
+//!   apn_node identity show-phrase   Show the recovery phrase
+//!   apn_node identity import        Replace the identity (phrase read from stdin)
 //!
-//! Options:
-//!   --port <PORT>       P2P port (default: 4001)
-//!   --relay <URL>       NATS relay URL (default: nats://nonlocal.info:4222)
-//!   --bootstrap <ADDR>  Bootstrap peer multiaddr
-//!   --new               Generate new identity
-//!   --import <PHRASE>   Import from mnemonic phrase
+//! The recovery phrase is shown once, when the identity is created, and only
+//! on an interactive terminal. It is never printed on a normal start.
 
-use std::env;
+use std::{
+    env,
+    io::{BufRead, IsTerminal, Write},
+    time::Duration,
+};
 
 use alpha_protocol_core::{
+    claim::{self, ClaimRecord},
+    heartbeat::{Capabilities, Hardware, Heartbeat, HEARTBEAT_INTERVAL_SECS},
     identity::NodeIdentity,
     identity_storage,
-    node::{AlphaNodeBuilder, NodeEvent},
-    DEFAULT_NATS_RELAY,
+    relay::{subjects, NatsRelay, RelayConfig, RelayEvent},
+    status::{self, NodeStatus, RelayState},
 };
 use tokio::sync::mpsc;
 
+/// Options for `apn_node run`.
+struct RunOptions {
+    /// `--relay`; overrides `APN_RELAY_URL`
+    relay_url: Option<String>,
+    heartbeat_interval: u64,
+    enable_heartbeat: bool,
+    device_name: Option<String>,
+    /// `--share-hardware` / `APN_SHARE_HARDWARE=1`: also send hostname and
+    /// hardware details. Off by default.
+    share_hardware: bool,
+    capabilities: Capabilities,
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        env::var(name)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter("info,alpha_protocol_core=debug")
-        .init();
+    let mut args: Vec<String> = env::args().collect();
 
-    let args: Vec<String> = env::args().collect();
+    // Subcommands that only read or change local files: quiet logging, no network.
+    match args.get(1).map(String::as_str) {
+        Some("identity") => {
+            init_logging("warn");
+            return identity_command(&args[2..]);
+        }
+        Some("claim-code") => {
+            init_logging("warn");
+            return claim_code_command();
+        }
+        Some("status") => {
+            init_logging("warn");
+            return status_command();
+        }
+        Some("run") => {
+            args.remove(1);
+        }
+        _ => {}
+    }
 
-    let mut port: u16 = 4001;
-    let mut relay_url = DEFAULT_NATS_RELAY.to_string();
-    let mut bootstrap_peers: Vec<String> = vec![];
-    let mut mnemonic: Option<String> = None;
-    let mut heartbeat_interval: u64 = 30; // seconds
-    let mut enable_heartbeat = true;
-    let mut device_name: Option<String> = None;
+    let mut opts = RunOptions {
+        relay_url: None,
+        heartbeat_interval: HEARTBEAT_INTERVAL_SECS,
+        enable_heartbeat: true,
+        device_name: env::var("APN_NODE_NAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+        share_hardware: env_flag("APN_SHARE_HARDWARE"),
+        capabilities: Capabilities::ALL,
+    };
 
-    // Parse args
+    let value = |args: &[String], i: usize| -> anyhow::Result<String> {
+        args.get(i + 1)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} requires a value", args[i]))
+    };
+
+    let mut ignored_p2p_flag = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--port" => {
-                port = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("--port requires a value"))?
-                    .parse()?;
-                i += 2;
-            }
             "--relay" => {
-                relay_url = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("--relay requires a value"))?
-                    .clone();
+                opts.relay_url = Some(value(&args, i)?);
                 i += 2;
-            }
-            "--bootstrap" => {
-                let peer = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("--bootstrap requires a value"))?
-                    .clone();
-                bootstrap_peers.push(peer);
-                i += 2;
-            }
-            "--import" => {
-                mnemonic = Some(
-                    args.get(i + 1)
-                        .ok_or_else(|| anyhow::anyhow!("--import requires a mnemonic phrase"))?
-                        .clone(),
-                );
-                i += 2;
-            }
-            "--new" => {
-                mnemonic = None;
-                i += 1;
             }
             "--heartbeat-interval" => {
-                heartbeat_interval = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("--heartbeat-interval requires a value"))?
-                    .parse()?;
+                opts.heartbeat_interval = value(&args, i)?.parse()?;
+                anyhow::ensure!(
+                    opts.heartbeat_interval >= 1,
+                    "--heartbeat-interval must be at least 1"
+                );
                 i += 2;
             }
             "--no-heartbeat" => {
-                enable_heartbeat = false;
+                opts.enable_heartbeat = false;
                 i += 1;
             }
             "--name" => {
-                device_name = Some(
-                    args.get(i + 1)
-                        .ok_or_else(|| anyhow::anyhow!("--name requires a value"))?
-                        .clone(),
-                );
+                opts.device_name = Some(value(&args, i)?);
                 i += 2;
+            }
+            "--share-hardware" => {
+                opts.share_hardware = true;
+                i += 1;
+            }
+            "--capabilities" => {
+                opts.capabilities =
+                    Capabilities::parse_list(&value(&args, i)?).map_err(anyhow::Error::msg)?;
+                i += 2;
+            }
+            // Peer-to-peer transport is not part of this build. Accept the old
+            // flags so existing scripts keep working, and say so.
+            "--port" | "--bootstrap" => {
+                value(&args, i)?;
+                ignored_p2p_flag = true;
+                i += 2;
+            }
+            "--import" => {
+                // A phrase on the command line ends up in shell history and in
+                // the process list. Refuse it.
+                anyhow::bail!(
+                    "--import is no longer accepted. Run `apn_node identity import` and enter the phrase when asked."
+                );
+            }
+            "--new" => {
+                // Kept for old scripts: a new identity is only ever created
+                // when none exists.
+                i += 1;
+            }
+            "--version" | "-V" => {
+                println!("apn_node {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
             }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
             }
-            _ => {
-                eprintln!("Unknown option: {}", args[i]);
+            other => {
+                eprintln!("Unknown option: {}\n", other);
                 print_help();
-                return Ok(());
+                std::process::exit(2);
             }
         }
     }
 
-    // Create event channel
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<NodeEvent>();
+    init_logging("info,async_nats=warn");
+    if ignored_p2p_flag {
+        tracing::warn!(
+            "--port/--bootstrap are ignored: this build has no peer-to-peer transport, \
+             it talks to the relay only"
+        );
+    }
 
+    run(opts).await
+}
+
+async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // Load or create identity (with persistence)
-    let identity = identity_storage::load_or_create_identity(mnemonic.as_deref())?;
+    let (identity, identity_created) = identity_storage::load_or_create()?;
+    if identity_created {
+        announce_new_identity(&identity)?;
+    }
+    let node_id = identity.short_id();
 
-    // Build the node with persistent identity
-    let mut builder = AlphaNodeBuilder::new()
-        .with_port(port)
-        .with_relay(&relay_url)
-        .with_bootstrap_peers(bootstrap_peers)
-        .with_capabilities(vec![
-            "compute".to_string(),
-            "relay".to_string(),
-            "storage".to_string(),
-        ])
-        .with_identity(identity);
+    // Claim code: created once, kept with the identity, only its hash is sent.
+    let (claim, claim_created) = claim::load_or_create(&node_id)?;
+    if claim_created {
+        announce_new_claim_code(&claim);
+    }
+    let claim_hash = claim.code.hash();
 
-    if let Some(ref name) = device_name {
-        builder = builder.with_device_name(name);
+    let mut relay_config = RelayConfig::from_env(&node_id)?;
+    if let Some(url) = &opts.relay_url {
+        relay_config.url = url.clone();
     }
 
-    let mut node = builder.build(event_tx)?;
+    tracing::info!(
+        "APN node {} v{} starting",
+        node_id,
+        env!("CARGO_PKG_VERSION")
+    );
 
-    println!("\n╔══════════════════════════════════════════════════════════════════╗");
-    println!("║              ALPHA PROTOCOL NETWORK - Node                       ║");
-    println!("╠══════════════════════════════════════════════════════════════════╣");
-    if let Some(ref name) = device_name {
-        println!("║  Name:     {:<53}║", name);
-    }
-    println!("║  Node ID:  {:<53}║", node.short_id());
-    println!("║  Address:  {:<53}║", node.address());
-    println!("║  P2P Port: {:<53}║", port);
-    println!("║  Relay:    {:<53}║", relay_url);
-    println!("╚══════════════════════════════════════════════════════════════════╝\n");
+    let (relay_tx, mut relay_rx) = mpsc::unbounded_channel::<RelayEvent>();
+    let mut relay = NatsRelay::new(relay_config, relay_tx);
 
-    // Print mnemonic for backup
-    let identity = NodeIdentity::from_mnemonic_phrase(&node.identity().mnemonic_phrase())?;
-    println!("📝 Mnemonic (save this for recovery):");
-    println!("   {}\n", identity.mnemonic_phrase());
+    // Status file read by `apn_node status`.
+    let mut node_status = NodeStatus::new(
+        &node_id,
+        &relay.display_url(),
+        opts.heartbeat_interval,
+        now_unix(),
+    );
+    save_status(&node_status);
 
-    // Start the node
-    println!("🚀 Starting node...");
-    node.start().await?;
-    println!("✅ Node started!\n");
+    // Returns immediately; the connection comes up (and comes back) in the
+    // background. A relay that is down does not stop the node from starting.
+    relay.connect().await?;
 
-    // Announce to the network (may fail if no peers yet, that's OK)
-    println!("📢 Announcing to network...");
-    match node.announce().await {
-        Ok(_) => println!("✅ Announced!\n"),
-        Err(e) => println!("⚠️  Announce pending (no peers yet): {}\n", e),
-    }
+    let mut ticker = tokio::time::interval(Duration::from_secs(opts.heartbeat_interval));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // the first tick fires at once; the connect event sends the first message
 
-    // Setup heartbeat interval
-    let mut heartbeat_timer = if enable_heartbeat {
-        println!("💓 Heartbeat enabled (interval: {}s)\n", heartbeat_interval);
-        Some(tokio::time::interval(std::time::Duration::from_secs(
-            heartbeat_interval,
-        )))
-    } else {
-        None
-    };
+    let mut announced = false;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
-    println!("👂 Listening for events... (Ctrl+C to quit)\n");
-
-    // Event loop
     loop {
         tokio::select! {
-            Some(event) = event_rx.recv() => {
+            Some(event) = relay_rx.recv() => {
                 match event {
-                    NodeEvent::Started { peer_id, address } => {
-                        println!("🟢 Node started: {} @ {}", peer_id, address);
-                    }
-                    NodeEvent::PeerConnected(peer) => {
-                        println!("🔗 Peer connected: {} ({} capabilities)",
-                            peer.peer_id,
-                            peer.capabilities.len()
-                        );
-                        if let Some(addr) = peer.wallet_address {
-                            println!("   Wallet: {}", addr);
+                    RelayEvent::Connected => {
+                        node_status.set_relay_state(RelayState::Connected, now_unix());
+                        // First connection: announce on apn.discovery.
+                        // Later reconnects: send a heartbeat straight away.
+                        let subject = if announced { subjects::HEARTBEAT } else { subjects::DISCOVERY };
+                        match publish_presence(&relay, &identity, &opts, &claim_hash, subject).await {
+                            Ok(()) => {
+                                announced = true;
+                                node_status.record_heartbeat(subject, now_unix());
+                                ticker.reset();
+                            }
+                            Err(e) => tracing::warn!("Could not publish to {}: {:#}", subject, e),
                         }
-                        for cap in &peer.capabilities {
-                            println!("   - {}", cap);
+                    }
+                    RelayEvent::Disconnected => {
+                        node_status.set_relay_state(RelayState::Disconnected, now_unix());
+                    }
+                    RelayEvent::Error(e) => {
+                        node_status.last_relay_error = Some(e);
+                        node_status.updated_at = now_unix();
+                    }
+                    RelayEvent::MessageReceived { .. } => {}
+                }
+                save_status(&node_status);
+            }
+            _ = ticker.tick() => {
+                if !opts.enable_heartbeat {
+                    // keep the status file fresh, send nothing
+                } else if !relay.is_connected() {
+                    tracing::debug!("Heartbeat skipped: relay not connected");
+                } else {
+                    let subject = if announced { subjects::HEARTBEAT } else { subjects::DISCOVERY };
+                    match publish_presence(&relay, &identity, &opts, &claim_hash, subject).await {
+                        Ok(()) => {
+                            announced = true;
+                            node_status.record_heartbeat(subject, now_unix());
                         }
-                    }
-                    NodeEvent::PeerDisconnected(peer_id) => {
-                        println!("🔴 Peer disconnected: {}", peer_id);
-                    }
-                    NodeEvent::MessageReceived { from, message } => {
-                        println!("📨 Message from {}: {:?}", from, message);
-                    }
-                    NodeEvent::RelayConnected => {
-                        println!("🌐 Relay connected");
-                    }
-                    NodeEvent::RelayDisconnected => {
-                        println!("⚠️  Relay disconnected");
-                    }
-                    NodeEvent::Error(e) => {
-                        eprintln!("❌ Error: {}", e);
+                        Err(e) => tracing::warn!("Heartbeat failed: {:#}", e),
                     }
                 }
+                node_status.updated_at = now_unix();
+                save_status(&node_status);
             }
-            Some(_) = async {
-                if let Some(ref mut timer) = heartbeat_timer {
-                    Some(timer.tick().await)
-                } else {
-                    None
-                }
-            } => {
-                // Send heartbeat
-                tracing::debug!("Sending heartbeat...");
-                if let Err(e) = node.send_heartbeat().await {
-                    tracing::error!("Heartbeat failed: {}", e);
-                } else {
-                    tracing::debug!("Heartbeat sent successfully");
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                println!("\n👋 Shutting down...");
+            _ = &mut shutdown => {
+                tracing::info!("Shutting down");
                 break;
             }
         }
     }
 
+    let _ = relay.disconnect().await;
+    node_status.set_relay_state(RelayState::Stopped, now_unix());
+    save_status(&node_status);
     Ok(())
 }
 
+fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// The status file is a convenience: failing to write it must not stop the node.
+fn save_status(status: &NodeStatus) {
+    if let Err(e) = status.save() {
+        tracing::debug!("Could not write status file: {:#}", e);
+    }
+}
+
+/// `apn_node status`: node id, relay connection, last heartbeat, claim code.
+/// Exit code 0 when the node is running and connected, 1 otherwise.
+fn status_command() -> anyhow::Result<()> {
+    let now = now_unix();
+    let data_dir = identity_storage::get_config_dir()?;
+
+    let Some(identity) = identity_storage::load_identity()? else {
+        println!("Node:            no identity yet in {}", data_dir.display());
+        println!("                 Start the node once to create one.");
+        std::process::exit(1);
+    };
+    let node_id = identity.short_id();
+    let ago = |t: i64| format!("{} ago", status::format_duration(now - t));
+
+    println!(
+        "Node:            {} (apn_node v{})",
+        node_id,
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let node_status = status::load()?.filter(|s| s.node_id == node_id);
+    let mut healthy = false;
+    match &node_status {
+        None => {
+            println!("Node process:    NOT RUNNING (it has never run with this identity)");
+            println!("Relay:           not connected");
+            println!("Last heartbeat:  none sent yet");
+        }
+        Some(s) => {
+            let alive = s.process_alive(now);
+            if alive {
+                println!(
+                    "Node process:    running (pid {}, up {})",
+                    s.pid,
+                    status::format_duration(now - s.started_at)
+                );
+                println!(
+                    "Relay:           {} - {} (for {})",
+                    s.relay_state.label(),
+                    s.relay_url,
+                    status::format_duration(now - s.relay_state_since)
+                );
+                if s.relay_state != RelayState::Connected {
+                    if let Some(err) = &s.last_relay_error {
+                        println!("                 last error: {}", err);
+                    }
+                }
+                healthy = s.relay_state == RelayState::Connected;
+            } else {
+                println!(
+                    "Node process:    NOT RUNNING (last seen {})",
+                    ago(s.updated_at)
+                );
+                println!("Relay:           not connected - {}", s.relay_url);
+            }
+            match (s.last_heartbeat_at, &s.last_heartbeat_subject) {
+                (Some(t), Some(subject)) => println!(
+                    "Last heartbeat:  {} on {} ({} sent since start, one every {} s)",
+                    ago(t),
+                    subject,
+                    s.heartbeats_sent,
+                    s.heartbeat_interval_secs
+                ),
+                _ => println!("Last heartbeat:  none sent yet"),
+            }
+        }
+    }
+
+    match claim::load(&node_id)? {
+        Some(record) => {
+            let created = chrono::DateTime::<chrono::Utc>::from_timestamp(record.created_at, 0)
+                .map(|t| t.format("%Y-%m-%d").to_string())
+                .unwrap_or_default();
+            println!(
+                "Claim code:      created {} - show it with `apn_node claim-code`",
+                created
+            );
+            println!(
+                "                 Whether the node has been claimed is shown in the Dashboard,"
+            );
+            println!("                 the node itself is not told.");
+        }
+        None => {
+            println!(
+                "Claim code:      not created yet - run `apn_node claim-code` or start the node"
+            );
+        }
+    }
+
+    if !healthy {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Publish a signed heartbeat to `subject` and wait until the relay has it.
+async fn publish_presence(
+    relay: &NatsRelay,
+    identity: &NodeIdentity,
+    opts: &RunOptions,
+    claim_hash: &str,
+    subject: &str,
+) -> anyhow::Result<()> {
+    // Hostname and hardware leave the machine only on explicit opt-in.
+    let hardware = if opts.share_hardware {
+        Some(Hardware {
+            hostname: alpha_protocol_core::resources::get_hostname(),
+            resources: alpha_protocol_core::resources::collect_resources()
+                .await
+                .ok(),
+        })
+    } else {
+        None
+    };
+
+    let heartbeat = Heartbeat::new_signed(
+        identity,
+        chrono::Utc::now().timestamp(),
+        claim_hash,
+        opts.capabilities,
+        opts.device_name.clone(),
+        hardware,
+    );
+    relay
+        .publish(subject, &serde_json::to_vec(&heartbeat)?)
+        .await?;
+    relay.flush().await?;
+    tracing::debug!("Published signed heartbeat to {}", subject);
+    Ok(())
+}
+
+/// Resolves on Ctrl+C or SIGTERM (what systemd sends on stop).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn init_logging(level: &str) {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("APN_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+/// Called exactly once per identity, right after it was created.
+///
+/// The phrase is shown only on an interactive terminal. When the node is
+/// started by a service manager, stdout is a log, so the phrase is not
+/// written there; the operator is pointed at `identity show-phrase` instead.
+fn announce_new_identity(identity: &NodeIdentity) -> anyhow::Result<()> {
+    if std::io::stdout().is_terminal() {
+        println!();
+        println!("A new node identity was created: {}", identity.short_id());
+        println!();
+        println!("RECOVERY PHRASE (shown only this once, write it down and keep it private):");
+        println!();
+        println!("    {}", identity.mnemonic_phrase());
+        println!();
+        println!("Anyone with this phrase can impersonate this node.");
+        println!("To see it again later: apn_node identity show-phrase");
+        println!();
+    } else {
+        tracing::info!(
+            "New node identity {} created. The recovery phrase is not written to logs; \
+             run `apn_node identity show-phrase` as the node's user to see it.",
+            identity.short_id()
+        );
+    }
+    Ok(())
+}
+
+/// Called once, right after the claim code was created. Like the recovery
+/// phrase, the code is printed only on an interactive terminal, never into a
+/// service log.
+fn announce_new_claim_code(claim: &ClaimRecord) {
+    if std::io::stdout().is_terminal() {
+        println!();
+        println!("CLAIM CODE:  {}", claim.code.display());
+        println!();
+        println!(
+            "Sign in to the Dashboard and enter this code to add the node to your organization."
+        );
+        println!("Keep it private. To see it again: apn_node claim-code");
+        println!();
+    } else {
+        tracing::info!(
+            "A claim code was created. It is not written to logs; \
+             run `apn_node claim-code` as the node's user to see it."
+        );
+    }
+}
+
+fn claim_code_command() -> anyhow::Result<()> {
+    let Some(identity) = identity_storage::load_identity()? else {
+        anyhow::bail!(
+            "No identity found in {}. Start the node once, then run this again.",
+            identity_storage::get_config_dir()?.display()
+        );
+    };
+    let (claim, _) = claim::load_or_create(&identity.short_id())?;
+    eprintln!("Node {}", identity.short_id());
+    eprintln!("Claim code (enter it in the Dashboard; keep it private):");
+    println!("{}", claim.code.display());
+    Ok(())
+}
+
+fn identity_command(args: &[String]) -> anyhow::Result<()> {
+    match args.first().map(String::as_str) {
+        Some("show-phrase") => {
+            let Some(identity) = identity_storage::load_identity()? else {
+                anyhow::bail!(
+                    "No identity found in {}. Start the node once to create one.",
+                    identity_storage::get_config_dir()?.display()
+                );
+            };
+            eprintln!("Node {}", identity.short_id());
+            eprintln!(
+                "Recovery phrase (keep it private; anyone with it can impersonate this node):"
+            );
+            println!("{}", identity.mnemonic_phrase());
+            Ok(())
+        }
+        Some("import") => {
+            let force = args.iter().any(|a| a == "--force");
+            if identity_storage::load_identity()?.is_some() && !force {
+                anyhow::bail!(
+                    "An identity already exists. Re-run with `identity import --force` to replace it \
+                     (the old identity file is kept as node_identity.json.backup)."
+                );
+            }
+            if std::io::stdin().is_terminal() {
+                eprint!("Enter the recovery phrase, then press Enter: ");
+                std::io::stderr().flush().ok();
+            }
+            let mut phrase = String::new();
+            std::io::stdin().lock().read_line(&mut phrase)?;
+            let identity = NodeIdentity::from_mnemonic_phrase(phrase.trim())
+                .map_err(|_| anyhow::anyhow!("That is not a valid recovery phrase."))?;
+            identity_storage::save_identity(&identity)?;
+            println!("Identity imported: {}", identity.short_id());
+            Ok(())
+        }
+        _ => {
+            eprintln!("Usage: apn_node identity <show-phrase|import [--force]>");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn print_help() {
-    println!("APN Node - Alpha Protocol Network CLI\n");
-    println!("Usage: apn_node [OPTIONS]\n");
-    println!("Options:");
-    println!("  --port <PORT>       P2P port (default: 4001)");
-    println!("  --relay <URL>       NATS relay URL (default: nats://nonlocal.info:4222)");
-    println!("  --bootstrap <ADDR>  Bootstrap peer multiaddr (can be used multiple times)");
-    println!("  --new               Generate new identity (WARNING: Creates new wallet!)");
-    println!("  --import <PHRASE>   Import from mnemonic phrase (quoted)");
+    println!("APN Node - Alpha Protocol Network node\n");
+    println!("Usage:");
+    println!("  apn_node [run] [OPTIONS]        Run the node (default)");
+    println!("  apn_node status                 Node id, relay connection, last heartbeat");
+    println!("  apn_node claim-code             Show the claim code for the Dashboard");
+    println!("  apn_node identity show-phrase   Show the recovery phrase");
+    println!("  apn_node identity import        Replace the identity (phrase read from stdin)\n");
+    println!("Options for run:");
+    println!("  --relay <URL>                Relay URL (overrides APN_RELAY_URL)");
     println!("  --heartbeat-interval <SECS>  Heartbeat interval in seconds (default: 30)");
-    println!("  --name <NAME>       Display name for this node (e.g. \"Sirak Studios\")");
-    println!("  --no-heartbeat      Disable heartbeat broadcasts");
-    println!("  -h, --help          Show this help\n");
-    println!("Identity Persistence:");
-    println!("  Identities are automatically saved to ~/.apn/node_identity.json");
-    println!("  On restart, the same identity (and wallet) is reused");
-    println!("  Backup your identity file to prevent loss of accumulated VIBE!\n");
-    println!("Examples:");
-    println!("  # Start (loads existing identity or creates new one)");
-    println!("  apn_node\n");
-    println!("  # Start on custom port");
-    println!("  apn_node --port 4002\n");
-    println!("  # Import existing identity (overwrites saved identity)");
-    println!("  apn_node --import \"word1 word2 word3 ...\"");
+    println!("  --name <NAME>                Display name for this node (also APN_NODE_NAME)");
+    println!("  --capabilities <LIST>        relay,compute,storage (default: all three)");
+    println!("  --share-hardware             Also send hostname and hardware details");
+    println!("                               (off by default; also APN_SHARE_HARDWARE=1)");
+    println!("  --no-heartbeat               Announce once, send no heartbeats");
+    println!("  -V, --version                Show the version");
+    println!("  -h, --help                   Show this help\n");
+    println!("Environment:");
+    println!("  APN_RELAY_URL       nats://host:4222 or tls://host:4222 (TLS)");
+    println!(
+        "                      default: {}",
+        alpha_protocol_core::DEFAULT_NATS_RELAY
+    );
+    println!("  APN_RELAY_USER      relay user name   (with APN_RELAY_PASSWORD)");
+    println!("  APN_RELAY_PASSWORD  relay password");
+    println!("  APN_RELAY_CREDS     path to a NATS .creds file (instead of user/password)");
+    println!("  APN_RELAY_CA        optional PEM file with the relay's CA certificate");
+    println!("  APN_DATA_DIR        where the identity is kept (default ~/.apn)");
+    println!("  APN_LOG             log filter, e.g. debug\n");
+    println!("Identity:");
+    println!("  Stored in $APN_DATA_DIR (default ~/.apn), readable only by its owner.");
+    println!("  The recovery phrase is shown once, when the identity is created.");
 }

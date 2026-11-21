@@ -1,0 +1,55 @@
+[Unit]
+Description=APN node (Alpha Protocol Network)
+Documentation=file:///usr/local/share/doc/apn-node/INSTALL.md
+After=network-online.target
+Wants=network-online.target
+# Keep trying forever; the node itself also reconnects to the relay.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+
+# Dedicated unprivileged account, created by install.sh.
+User=apn
+Group=apn
+
+# Settings (relay address and credentials). Owned by root, readable by the
+# apn group only.
+EnvironmentFile=/etc/apn/node.env
+
+# Identity, claim code and status live here (/var/lib/apn, owner-only).
+StateDirectory=apn
+StateDirectoryMode=0700
+Environment=APN_DATA_DIR=/var/lib/apn
+
+ExecStart=/usr/local/bin/apn_node run
+
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+
+# The node needs outbound network and its own state directory, nothing else.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

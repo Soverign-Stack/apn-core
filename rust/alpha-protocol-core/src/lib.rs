@@ -21,8 +21,10 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+pub mod claim;
 pub mod crypto;
 pub mod economics;
+pub mod heartbeat;
 pub mod models;
 pub mod identity;
 pub mod identity_storage;
@@ -33,6 +35,7 @@ pub mod relay;
 pub mod resources;
 pub mod reward_distributor;
 pub mod reward_tracker;
+pub mod status;
 pub mod wire;
 
 // Re-exports
